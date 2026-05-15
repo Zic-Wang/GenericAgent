@@ -307,6 +307,8 @@ APP_SECRET = str(mykeys.get("fs_app_secret", "") or "").strip()
 ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
 AGENT_TIMEOUT_SEC = 900
+# Feishu emoji_type for the transient "bot is typing" reaction.
+TYPING_REACTION_EMOJI = "Typing"
 
 
 agent = GeneraticAgent()
@@ -839,6 +841,7 @@ def handle_message(data):
         return
     open_id = sender.sender_id.open_id
     chat_id = message.chat_id
+    incoming_message_id = message.message_id
     if not PUBLIC_ACCESS and open_id not in ALLOWED_USERS:
         print(f"未授权用户: {open_id}")
         return
@@ -857,6 +860,9 @@ def handle_message(data):
         user_tasks[open_id] = {"running": True}
         receive_id = chat_id or open_id
         rid_type = "chat_id" if chat_id else "open_id"
+        typing_reaction_id = None
+        if incoming_message_id:
+            typing_reaction_id = add_message_reaction_get_id(incoming_message_id, TYPING_REACTION_EMOJI)
         done_event = threading.Event()
         hook_key = f"fs_{open_id}"
         card = _TaskCard(receive_id, rid_type)
@@ -902,6 +908,8 @@ def handle_message(data):
             traceback.print_exc()
             card.fail(f"错误: {e}")
         finally:
+            if incoming_message_id:
+                delete_own_reaction_by_type(incoming_message_id, TYPING_REACTION_EMOJI, typing_reaction_id)
             agent._turn_end_hooks.pop(hook_key, None)
             user_tasks.pop(open_id, None)
 
