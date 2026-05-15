@@ -323,6 +323,8 @@ client, user_tasks = None, {}
 SENT_MESSAGES = OrderedDict()
 _MAX_SENT_MESSAGES = 200
 _APPROVAL_STATE = {}
+_APPROVAL_DONE = {}
+_APPROVAL_DONE_TTL_SEC = 600
 _APPROVAL_LOCK = threading.RLock()
 _APPROVAL_CHOICE_MAP = {
     "approve_once": "once",
@@ -505,28 +507,34 @@ def update_approval_card(message_id, approval_id, cmd, reason, choice, operator_
     return _patch_card_result(message_id, json.dumps(card, ensure_ascii=False))[0]
 
 
-def send_exec_approval(chat_id, session_key, cmd, reason, requester_open_id=None, timeout_sec=300):
+def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=None, timeout_sec=300, receive_id_type="chat_id"):
     """Send a Feishu interactive approval card and block until a button resolves it."""
     approval_id = uuid.uuid4().hex
     event = threading.Event()
-    card = build_exec_approval_card(approval_id, cmd, reason, requester_open_id)
-    message_id = _send_raw(chat_id, json.dumps(card, ensure_ascii=False), "interactive", "chat_id")
-    if not message_id:
-        return "deny"
     state = {
         "approval_id": approval_id,
         "session_key": session_key,
         "cmd": cmd,
         "reason": reason,
-        "chat_id": chat_id,
-        "message_id": message_id,
+        "receive_id": receive_id,
+        "receive_id_type": receive_id_type,
+        "message_id": None,
         "created_at": time.time(),
         "event": event,
         "result": None,
         "requester_open_id": requester_open_id,
     }
+    # Register before sending the card. Feishu users can click very quickly; if the
+    # callback arrives before _APPROVAL_STATE is populated, it looks "expired".
     with _APPROVAL_LOCK:
         _APPROVAL_STATE[approval_id] = state
+    card = build_exec_approval_card(approval_id, cmd, reason, requester_open_id)
+    message_id = _send_raw(receive_id, json.dumps(card, ensure_ascii=False), "interactive", receive_id_type)
+    if not message_id:
+        with _APPROVAL_LOCK:
+            _APPROVAL_STATE.pop(approval_id, None)
+        return "deny"
+    state["message_id"] = message_id
     if not event.wait(timeout_sec):
         with _APPROVAL_LOCK:
             _APPROVAL_STATE.pop(approval_id, None)
@@ -535,14 +543,30 @@ def send_exec_approval(chat_id, session_key, cmd, reason, requester_open_id=None
     return state.get("result") or "deny"
 
 
+def _cleanup_approval_done(now=None):
+    now = now or time.time()
+    expired = [
+        approval_id for approval_id, state in _APPROVAL_DONE.items()
+        if now - state.get("resolved_at", 0) > _APPROVAL_DONE_TTL_SEC
+    ]
+    for approval_id in expired:
+        _APPROVAL_DONE.pop(approval_id, None)
+
+
 def resolve_approval(approval_id, choice, operator_open_id=None, operator_name=None, patch_card=True):
     with _APPROVAL_LOCK:
+        _cleanup_approval_done()
         state = _APPROVAL_STATE.pop(approval_id, None)
-    if not state:
-        return False, "approval not found or expired"
-    state["result"] = choice
-    state["operator_open_id"] = operator_open_id
-    state["operator_name"] = operator_name
+        if not state:
+            done_state = _APPROVAL_DONE.get(approval_id)
+            if done_state:
+                return True, done_state
+            return False, "approval not found or expired"
+        state["result"] = choice
+        state["operator_open_id"] = operator_open_id
+        state["operator_name"] = operator_name
+        state["resolved_at"] = time.time()
+        _APPROVAL_DONE[approval_id] = state
     if patch_card:
         update_approval_card(
             state.get("message_id"),
@@ -573,6 +597,7 @@ def handle_card_action(data):
     choice = _APPROVAL_CHOICE_MAP[action_name]
     ok, state = resolve_approval(approval_id, choice, open_id, operator_name, patch_card=False)
     if not ok:
+        print(f"[WARN] approval action missing or expired: approval_id={approval_id}, operator={open_id}")
         return _approval_toast("审批已处理或已过期", "warning")
     result_card = build_approval_result_card(
         state.get("approval_id", approval_id),
@@ -977,11 +1002,76 @@ class _TaskCard:
         self._push()
 
 
-def _make_task_hook(card, done_event, on_final):
+def _extract_ask_user_event(ctx):
+    exit_reason = (ctx or {}).get("exit_reason") or {}
+    if exit_reason.get("result") != "EXITED":
+        return None
+    payload = exit_reason.get("data")
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") != "INTERRUPT" or payload.get("intent") != "HUMAN_INTERVENTION":
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    question = str(data.get("question") or "请审批下一步操作：").strip() or "请审批下一步操作："
+    raw_candidates = data.get("candidates") or []
+    if not isinstance(raw_candidates, (list, tuple)):
+        raw_candidates = []
+    candidates = [str(c).strip() for c in raw_candidates if str(c).strip()]
+    return {"question": question, "candidates": candidates}
+
+
+def _candidate_score(candidate, keywords):
+    text = str(candidate or "").lower()
+    return sum(1 for kw in keywords if kw in text)
+
+
+def _select_ask_user_candidate(event, approval_choice):
+    candidates = list((event or {}).get("candidates") or [])
+    if not candidates:
+        return {
+            "approve_once": "Allow Once",
+            "approve_session": "Allow Session",
+            "approve_always": "Always Allow",
+            "deny": "Deny",
+            "timeout": "Deny",
+        }.get(approval_choice, str(approval_choice or "Deny"))
+    keyword_map = {
+        "approve_once": ["allow once", "once", "本次", "一次", "允许"],
+        "approve_session": ["session", "会话", "本会话"],
+        "approve_always": ["always", "永久", "始终", "以后"],
+        "deny": ["deny", "reject", "拒绝", "不允许", "取消", "no"],
+        "timeout": ["deny", "reject", "拒绝", "不允许", "取消", "no"],
+    }
+    keywords = keyword_map.get(approval_choice) or []
+    ranked = sorted((( _candidate_score(c, keywords), idx, c) for idx, c in enumerate(candidates)), reverse=True)
+    if ranked and ranked[0][0] > 0:
+        return ranked[0][2]
+    if approval_choice in ("deny", "timeout"):
+        return candidates[-1]
+    return candidates[0]
+
+
+def _format_ask_user_cmd(event):
+    question = str((event or {}).get("question") or "请审批下一步操作：")
+    candidates = list((event or {}).get("candidates") or [])
+    if not candidates:
+        return question
+    lines = [question, "", "候选项："]
+    lines.extend(f"{idx}. {candidate}" for idx, candidate in enumerate(candidates, start=1))
+    return "\n".join(lines)
+
+
+def _make_task_hook(card, done_event, on_final, on_ask_user=None):
     """飞书任务 hook：每轮 patch 卡片状态；结束触发 on_final(raw) 处理附件。"""
     def hook(ctx):
         try:
             if ctx.get('exit_reason'):
+                ask_event = _extract_ask_user_event(ctx)
+                if ask_event and on_ask_user:
+                    on_ask_user(ask_event)
+                    return
                 resp = ctx.get('response')
                 raw = resp.content if hasattr(resp, 'content') else str(resp)
                 display = _display_text(raw)
@@ -1049,6 +1139,7 @@ def handle_message(data):
         if incoming_message_id:
             typing_reaction_id = add_message_reaction_get_id(incoming_message_id, TYPING_REACTION_EMOJI)
         done_event = threading.Event()
+        ask_user_events = Q.Queue()
         hook_key = f"fs_{open_id}"
         card = _TaskCard(receive_id, rid_type)
         card.start()
@@ -1056,8 +1147,10 @@ def handle_message(data):
         def on_final(raw):
             final_raw_holder["text"] = raw or ""
             _send_generated_files(receive_id, raw, receive_id_type=rid_type)
+        def on_ask_user(event):
+            ask_user_events.put(event)
         if not hasattr(agent, '_turn_end_hooks'): agent._turn_end_hooks = {}
-        agent._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final)
+        agent._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final, on_ask_user)
         try:
             # Keep the display_queue as the authoritative completion channel.
             # The turn_end_hook updates the rich card per turn, but startup/cold-run
@@ -1084,6 +1177,25 @@ def handle_message(data):
                     agent.abort()
                     card.fail("已停止")
                     break
+                try:
+                    ask_event = ask_user_events.get_nowait()
+                except Q.Empty:
+                    ask_event = None
+                if ask_event:
+                    choice = send_exec_approval(
+                        receive_id=receive_id,
+                        receive_id_type=rid_type,
+                        session_key=f"ask-user:{open_id}:{int(time.time())}",
+                        cmd=_format_ask_user_cmd(ask_event),
+                        reason="agent requested human approval via ask_user",
+                        requester_open_id=open_id,
+                        timeout_sec=AGENT_TIMEOUT_SEC,
+                    )
+                    selected = _select_ask_user_candidate(ask_event, choice)
+                    card.step("审批结果", f"{choice}: {selected}")
+                    agent.put_task(selected, source="feishu")
+                    start = time.time()
+                    continue
                 if time.time() - start > AGENT_TIMEOUT_SEC:
                     agent.abort()
                     card.fail("任务超时")
@@ -1117,7 +1229,7 @@ def handle_command(open_id, cmd, chat_id=None):
     elif op == "/new":
         _send_cmd_response(reset_conversation(agent))
     elif op == "/help":
-        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/edit last <文本> - 编辑最近一条机器人消息\n/recall last - 撤回最近一条机器人消息\n/react <last|message_id> <emoji_type> - 添加表情回应\n/reactions <last|message_id> [emoji_type] - 查看回应摘要\n/approval_test - 发送审批闭环测试卡\n/help - 显示帮助")
+        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/edit last <文本> - 编辑最近一条机器人消息\n/recall last - 撤回最近一条机器人消息\n/react <last|message_id> <emoji_type> - 添加表情回应\n/reactions <last|message_id> [emoji_type] - 查看回应摘要\n/help - 显示帮助")
     elif op == "/status":
         llm = agent.get_llm_name() if agent.llmclient else "未配置"
         _send_cmd_response(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
@@ -1186,28 +1298,6 @@ def handle_command(open_id, cmd, chat_id=None):
             _send_cmd_response(f"已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
         except Exception as e:
             _send_cmd_response(f"恢复失败: {e}")
-    elif op == "/approval_test":
-        target_chat_id = chat_id or DEFAULT_CHAT_ID
-        if not target_chat_id:
-            return _send_cmd_response("❌ 当前没有可发送审批卡的 chat_id")
-
-        def _run_approval_test():
-            try:
-                choice = send_exec_approval(
-                    target_chat_id,
-                    session_key=f"approval-test:{open_id or target_chat_id}:{int(time.time())}",
-                    cmd="echo approval test",
-                    reason="manual live approval card test",
-                    requester_open_id=open_id,
-                    timeout_sec=180,
-                )
-                print(f"[INFO] approval_test completed: {choice}")
-            except Exception as e:
-                print(f"[ERROR] approval_test failed: {e}")
-                _send_raw(target_chat_id, json.dumps({"text": f"审批测试失败: {e}"}, ensure_ascii=False), "text", "chat_id")
-
-        threading.Thread(target=_run_approval_test, daemon=True).start()
-        _send_cmd_response("已发送审批测试卡，请点击按钮验证。")
     elif op == "/continue" or cmd.startswith("/continue"):
         _send_cmd_response(handle_continue_frontend(agent, cmd))
     else:
