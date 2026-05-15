@@ -11,6 +11,7 @@ sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
 from agentmain import GeneraticAgent
 from frontends.approval_store import ApprovalStore, RESOLVED
+from frontends.ga_inbound_message import GAInboundMessage
 from frontends.chatapp_common import format_restore
 from frontends.continue_cmd import handle_frontend_command as handle_continue_frontend, reset_conversation
 from llmcore import mykeys
@@ -1171,6 +1172,43 @@ def _make_task_hook(card, done_event, on_final, on_ask_user=None):
     return hook
 
 
+def _ga_inbound_from_lark_event(message, sender, content_text="", resources=None):
+    """Build GAInboundMessage from the legacy lark_oapi event objects.
+
+    This is an observe-only bridge for the Channel migration: callers keep using
+    existing fsapp parsing/authorization behavior while a stable GA message model
+    becomes available for future replacements.
+    """
+    sender_id = getattr(getattr(sender, "sender_id", None), "open_id", None)
+    raw = {
+        "message_type": getattr(message, "message_type", None),
+        "chat_id": getattr(message, "chat_id", None),
+        "message_id": getattr(message, "message_id", None),
+    }
+    try:
+        mentions = getattr(message, "mentions", None) or []
+    except Exception:
+        mentions = []
+    try:
+        reply_to = getattr(message, "parent_id", None) or getattr(message, "root_id", None)
+    except Exception:
+        reply_to = None
+    return GAInboundMessage.from_feishu_channel({
+        "message_id": getattr(message, "message_id", "") or "",
+        "chat_id": getattr(message, "chat_id", None),
+        "chat_type": getattr(message, "chat_type", None),
+        "sender_id": sender_id,
+        "sender_name": getattr(sender, "sender_type", None),
+        "content_text": content_text or "",
+        "reply_to_message_id": reply_to,
+        "mentions": mentions,
+        "mentioned_bot": bool(mentions),
+        "mentioned_all": False,
+        "resources": resources or [],
+        "raw": raw,
+    })
+
+
 def handle_message(data):
     event, message, sender = data.event, data.event.message, data.event.sender
     msg_id = getattr(message, "message_id", "") or ""
@@ -1184,13 +1222,19 @@ def handle_message(data):
         print(f"未授权用户: {open_id}")
         return
     user_input, image_paths = _build_user_message(message)
+    ga_msg = _ga_inbound_from_lark_event(
+        message,
+        sender,
+        content_text=user_input,
+        resources=[{"type": "image", "name": path, "key": path} for path in image_paths],
+    )
     if not user_input:
         if chat_id:
             send_message(chat_id, f"⚠️ 暂不支持处理此类飞书消息：{message.message_type}", receive_id_type="chat_id")
         else:
             send_message(open_id, f"⚠️ 暂不支持处理此类飞书消息：{message.message_type}")
         return
-    print(f"收到消息 [{open_id}] ({message.message_type}, {len(image_paths)} images): {user_input[:200]}")
+    print(f"收到消息 [{open_id}] ({message.message_type}, {len(image_paths)} images, ga_msg={ga_msg.message_id}): {user_input[:200]}")
     if message.message_type == "text" and user_input.startswith("/"):
         return handle_command(open_id, user_input, chat_id)
 

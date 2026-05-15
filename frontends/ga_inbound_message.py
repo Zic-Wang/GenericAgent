@@ -52,24 +52,29 @@ class GAInboundMessage:
 
     @classmethod
     def from_feishu_channel(cls, msg: Any) -> "GAInboundMessage":
-        """Build from ``lark_oapi.channel.types.InboundMessage``-like object."""
-        conversation = getattr(msg, "conversation", None)
-        sender = getattr(msg, "sender", None)
-        reply = getattr(msg, "reply", None)
+        """Build from ``lark_oapi.channel.types.InboundMessage``-like object.
+
+        Accepts both SDK objects and plain dictionaries so legacy fsapp code can
+        construct an observe-only normalized message without depending on the
+        SDK Channel inbound model yet.
+        """
+        conversation = _get_value(msg, "conversation")
+        sender = _get_value(msg, "sender")
+        reply = _get_value(msg, "reply")
         return cls(
-            message_id=str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or ""),
-            chat_id=_first_attr(conversation, "id", "chat_id", "open_chat_id"),
-            chat_type=_first_attr(conversation, "type", "chat_type"),
-            sender_id=_first_attr(sender, "open_id", "user_id", "union_id", "id"),
-            sender_name=_first_attr(sender, "name", "display_name", "nickname"),
-            content_text=str(getattr(msg, "content_text", "") or ""),
-            reply_to_message_id=_first_attr(reply, "message_id", "id"),
-            mentions=[_mention_from_obj(m) for m in (getattr(msg, "mentions", None) or [])],
-            mentioned_bot=bool(getattr(msg, "mentioned_bot", False)),
-            mentioned_all=bool(getattr(msg, "mentioned_all", False)),
-            resources=[_resource_from_obj(r) for r in (getattr(msg, "resources", None) or [])],
-            raw_content_type=getattr(msg, "raw_content_type", None),
-            raw=getattr(msg, "raw", None) or {},
+            message_id=str(_first_attr(msg, "id", "message_id") or ""),
+            chat_id=_first_attr(msg, "chat_id", "open_chat_id") or _first_attr(conversation, "id", "chat_id", "open_chat_id"),
+            chat_type=_first_attr(msg, "chat_type") or _first_attr(conversation, "type", "chat_type"),
+            sender_id=_first_attr(msg, "sender_id", "open_id", "user_id", "union_id") or _first_attr(sender, "open_id", "user_id", "union_id", "id"),
+            sender_name=_first_attr(msg, "sender_name") or _first_attr(sender, "name", "display_name", "nickname"),
+            content_text=str(_get_value(msg, "content_text", "") or ""),
+            reply_to_message_id=_first_attr(msg, "reply_to_message_id") or _first_attr(reply, "message_id", "id"),
+            mentions=[_mention_from_obj(m) for m in (_get_value(msg, "mentions", []) or [])],
+            mentioned_bot=bool(_get_value(msg, "mentioned_bot", False)),
+            mentioned_all=bool(_get_value(msg, "mentioned_all", False)),
+            resources=[_resource_from_obj(r) for r in (_get_value(msg, "resources", []) or [])],
+            raw_content_type=_get_value(msg, "raw_content_type"),
+            raw=_get_value(msg, "raw", {}) or {},
         )
 
     def to_agent_text(self) -> str:
@@ -84,18 +89,21 @@ class GAInboundMessage:
         return (self.chat_type or "").lower() in {"p2p", "direct", "private"}
 
 
+def _get_value(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def _first_attr(obj: Any, *names: str) -> Optional[str]:
     if obj is None:
         return None
     for name in names:
-        val = getattr(obj, name, None)
+        val = _get_value(obj, name)
         if val is not None and val != "":
             return str(val)
-    if isinstance(obj, dict):
-        for name in names:
-            val = obj.get(name)
-            if val is not None and val != "":
-                return str(val)
     return None
 
 
