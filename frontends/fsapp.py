@@ -10,6 +10,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
 from agentmain import GeneraticAgent
+from frontends.approval_store import ApprovalStore, RESOLVED
 from frontends.chatapp_common import format_restore
 from frontends.continue_cmd import handle_frontend_command as handle_continue_frontend, reset_conversation
 from llmcore import mykeys
@@ -325,6 +326,7 @@ _MAX_SENT_MESSAGES = 200
 _APPROVAL_STATE = {}
 _APPROVAL_DONE = {}
 _APPROVAL_DONE_TTL_SEC = 600
+_APPROVAL_STORE = ApprovalStore(os.path.join(TEMP_DIR, "approval_state.sqlite3"), done_ttl_sec=_APPROVAL_DONE_TTL_SEC)
 _APPROVAL_LOCK = threading.RLock()
 _APPROVAL_CHOICE_MAP = {
     "approve_once": "once",
@@ -507,10 +509,51 @@ def update_approval_card(message_id, approval_id, cmd, reason, choice, operator_
     return _patch_card_result(message_id, json.dumps(card, ensure_ascii=False))[0]
 
 
+def _approval_state_from_record(record, local_state=None):
+    if not record:
+        return local_state or {}
+    state = dict(local_state or {})
+    state.update({
+        "approval_id": record.approval_id,
+        "session_key": record.session_key,
+        "cmd": record.cmd,
+        "reason": record.reason,
+        "receive_id": record.receive_id,
+        "receive_id_type": record.receive_id_type,
+        "message_id": record.message_id,
+        "result": record.result,
+        "requester_open_id": record.requester_open_id,
+        "operator_open_id": record.operator_open_id,
+        "operator_name": record.operator_name,
+        "created_at": record.created_at,
+        "resolved_at": record.resolved_at,
+        "expires_at": record.expires_at,
+    })
+    return state
+
+
 def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=None, timeout_sec=300, receive_id_type="chat_id"):
-    """Send a Feishu interactive approval card and block until a button resolves it."""
+    """Send a Feishu interactive approval card and block until resolved.
+
+    The SQLite ApprovalStore is the source of truth for pending/resolved state.
+    In-memory state is retained only to wake the local waiting thread quickly.
+    The wait loop also polls the store so a callback handled by another process
+    can still release this caller.
+    """
     approval_id = uuid.uuid4().hex
     event = threading.Event()
+    _APPROVAL_STORE.cleanup_done()
+    _APPROVAL_STORE.expire_pending()
+    _APPROVAL_STORE.create_pending(
+        approval_id=approval_id,
+        session_key=session_key,
+        receive_id=receive_id,
+        receive_id_type=receive_id_type,
+        cmd=cmd,
+        reason=reason,
+        requester_open_id=requester_open_id,
+        timeout_sec=timeout_sec,
+    )
     state = {
         "approval_id": approval_id,
         "session_key": session_key,
@@ -525,7 +568,7 @@ def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=N
         "requester_open_id": requester_open_id,
     }
     # Register before sending the card. Feishu users can click very quickly; if the
-    # callback arrives before _APPROVAL_STATE is populated, it looks "expired".
+    # callback arrives before local memory is populated, it looks "expired".
     with _APPROVAL_LOCK:
         _APPROVAL_STATE[approval_id] = state
     card = build_exec_approval_card(approval_id, cmd, reason, requester_open_id)
@@ -533,52 +576,72 @@ def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=N
     if not message_id:
         with _APPROVAL_LOCK:
             _APPROVAL_STATE.pop(approval_id, None)
-        return "deny"
+        _APPROVAL_STORE.resolve(approval_id, "send_failed")
+        return "send_failed"
     state["message_id"] = message_id
-    if not event.wait(timeout_sec):
+    _APPROVAL_STORE.set_message_id(approval_id, message_id)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        remaining = max(0.0, min(1.0, deadline - time.time()))
+        event.wait(remaining)
+        rec = _APPROVAL_STORE.get(approval_id)
+        if rec and rec.status == RESOLVED:
+            with _APPROVAL_LOCK:
+                _APPROVAL_STATE.pop(approval_id, None)
+            return rec.result or "deny"
+        if event.is_set():
+            break
+    rec = _APPROVAL_STORE.get(approval_id)
+    if rec and rec.status == RESOLVED:
         with _APPROVAL_LOCK:
             _APPROVAL_STATE.pop(approval_id, None)
-        update_approval_card(message_id, approval_id, cmd, reason, "timeout", None)
-        return "timeout"
-    return state.get("result") or "deny"
-
-
-def _cleanup_approval_done(now=None):
-    now = now or time.time()
-    expired = [
-        approval_id for approval_id, state in _APPROVAL_DONE.items()
-        if now - state.get("resolved_at", 0) > _APPROVAL_DONE_TTL_SEC
-    ]
-    for approval_id in expired:
-        _APPROVAL_DONE.pop(approval_id, None)
+        return rec.result or "deny"
+    with _APPROVAL_LOCK:
+        _APPROVAL_STATE.pop(approval_id, None)
+    result = _APPROVAL_STORE.resolve(approval_id, "timeout")
+    timeout_state = _approval_state_from_record(result.record, state)
+    update_approval_card(message_id, approval_id, cmd, reason, "timeout", None)
+    return timeout_state.get("result") or "timeout"
 
 
 def resolve_approval(approval_id, choice, operator_open_id=None, operator_name=None, patch_card=True):
+    result = _APPROVAL_STORE.resolve(
+        approval_id,
+        choice,
+        operator_open_id=operator_open_id,
+        operator_name=operator_name,
+    )
     with _APPROVAL_LOCK:
-        _cleanup_approval_done()
-        state = _APPROVAL_STATE.pop(approval_id, None)
-        if not state:
-            done_state = _APPROVAL_DONE.get(approval_id)
-            if done_state:
-                return True, done_state
-            return False, "approval not found or expired"
-        state["result"] = choice
-        state["operator_open_id"] = operator_open_id
-        state["operator_name"] = operator_name
-        state["resolved_at"] = time.time()
+        local_state = _APPROVAL_STATE.pop(approval_id, None)
+    if not result.ok:
+        # Backward-compatible fallback for very old in-memory approvals created
+        # before the store was wired in this process.
+        if local_state is None:
+            return False, result.reason
+        local_state["result"] = choice
+        local_state["operator_open_id"] = operator_open_id
+        local_state["operator_name"] = operator_name
+        local_state["resolved_at"] = time.time()
+        with _APPROVAL_LOCK:
+            _APPROVAL_DONE[approval_id] = local_state
+        local_state.get("event").set()
+        return True, local_state
+    state = _approval_state_from_record(result.record, local_state)
+    state["result"] = result.record.result if result.record else choice
+    if local_state and local_state.get("event"):
+        local_state.get("event").set()
+    with _APPROVAL_LOCK:
         _APPROVAL_DONE[approval_id] = state
     if patch_card:
         update_approval_card(
             state.get("message_id"),
-            state.get("approval_id"),
+            state.get("approval_id", approval_id),
             state.get("cmd", ""),
             state.get("reason", ""),
-            choice,
+            state.get("result") or choice,
             operator_name,
         )
-    state.get("event").set()
     return True, state
-
 
 def handle_card_action(data):
     event = getattr(data, "event", None)
