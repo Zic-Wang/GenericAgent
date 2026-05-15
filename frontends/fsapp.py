@@ -1,4 +1,5 @@
 import glob, json, os, queue as Q, re, sys, threading, time
+from collections import OrderedDict
 import atexit, hashlib
 try:
     import msvcrt
@@ -307,6 +308,7 @@ ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
 AGENT_TIMEOUT_SEC = 900
 
+
 agent = GeneraticAgent()
 _agent_thread = threading.Thread(target=agent.run, daemon=True, name="GA-core")
 _agent_thread.start()
@@ -315,6 +317,33 @@ try:
 except Exception as e:
     print(f"[WARN] GA core started but status unavailable: {e}")
 client, user_tasks = None, {}
+SENT_MESSAGES = OrderedDict()
+_MAX_SENT_MESSAGES = 200
+
+
+def _record_sent_message(message_id, receive_id=None, receive_id_type=None, msg_type=None):
+    if not message_id:
+        return
+    SENT_MESSAGES[message_id] = {
+        "receive_id": receive_id,
+        "receive_id_type": receive_id_type,
+        "msg_type": msg_type,
+        "ts": time.time(),
+    }
+    SENT_MESSAGES.move_to_end(message_id)
+    while len(SENT_MESSAGES) > _MAX_SENT_MESSAGES:
+        SENT_MESSAGES.popitem(last=False)
+
+
+def _last_sent_message_id(receive_id=None):
+    for message_id, meta in reversed(SENT_MESSAGES.items()):
+        if receive_id is None or meta.get("receive_id") == receive_id:
+            return message_id
+    return next(reversed(SENT_MESSAGES), None) if SENT_MESSAGES else None
+
+
+def _is_own_sent_message(message_id):
+    return bool(message_id and message_id in SENT_MESSAGES)
 
 
 def create_client():
@@ -340,7 +369,9 @@ def _send_raw(receive_id, payload, msg_type, rtype):
         ).build()
         r = client.im.v1.message.create(body)
         if r.success():
-            return r.data.message_id if r.data else None
+            message_id = r.data.message_id if r.data else None
+            _record_sent_message(message_id, receive_id, rtype, msg_type)
+            return message_id
         print(f"发送失败: {r.code}, {r.msg}")
     except Exception as e:
         print(f"[ERROR] _send_raw 网络异常: {e}")
@@ -376,6 +407,117 @@ def send_message(receive_id, content, msg_type="text", use_card=False, receive_i
 
 def update_message(message_id, content):
     return _patch_card(message_id, _card(content))
+
+
+def edit_message_raw(message_id, content):
+    """Edit a Feishu message with raw content JSON string."""
+    try:
+        body = PatchMessageRequest.builder().message_id(message_id).request_body(
+            PatchMessageRequestBody.builder().content(content).build()
+        ).build()
+        r = client.im.v1.message.patch(body)
+        if not r.success():
+            print(f"[ERROR] edit_message 失败: {r.code}, {r.msg}")
+        return r.success(), r
+    except Exception as e:
+        print(f"[ERROR] edit_message 网络异常: {e}")
+        return False, None
+
+
+def edit_text_message(message_id, text):
+    return edit_message_raw(message_id, json.dumps({"text": text}, ensure_ascii=False))
+
+
+def edit_card_message(message_id, content):
+    return edit_message_raw(message_id, _card(content))
+
+
+def recall_message(message_id):
+    """Recall/delete a message. Callers should restrict this to bot-sent message ids."""
+    try:
+        body = DeleteMessageRequest.builder().message_id(message_id).build()
+        r = client.im.v1.message.delete(body)
+        if not r.success():
+            print(f"[ERROR] recall_message 失败: {r.code}, {r.msg}")
+            return False, r
+        SENT_MESSAGES.pop(message_id, None)
+        return True, r
+    except Exception as e:
+        print(f"[ERROR] recall_message 网络异常: {e}")
+        return False, None
+
+
+def add_message_reaction(message_id, emoji_type):
+    try:
+        body = CreateMessageReactionRequest.builder().message_id(message_id).request_body(
+            CreateMessageReactionRequestBody.builder().reaction_type(
+                Emoji.builder().emoji_type(emoji_type).build()
+            ).build()
+        ).build()
+        r = client.im.v1.message_reaction.create(body)
+        if not r.success():
+            print(f"[ERROR] add_reaction 失败: {r.code}, {r.msg}")
+        return r.success(), r
+    except Exception as e:
+        print(f"[ERROR] add_reaction 网络异常: {e}")
+        return False, None
+
+
+def list_message_reactions(message_id, reaction_type=None, page_size=20):
+    try:
+        builder = ListMessageReactionRequest.builder().message_id(message_id).page_size(page_size)
+        if reaction_type:
+            builder = builder.reaction_type(reaction_type)
+        r = client.im.v1.message_reaction.list(builder.build())
+        if not r.success():
+            print(f"[ERROR] list_reactions 失败: {r.code}, {r.msg}")
+            return None, r
+        return r.data, r
+    except Exception as e:
+        print(f"[ERROR] list_reactions 网络异常: {e}")
+        return None, None
+
+
+def delete_message_reaction(message_id, reaction_id):
+    try:
+        body = DeleteMessageReactionRequest.builder().message_id(message_id).reaction_id(reaction_id).build()
+        r = client.im.v1.message_reaction.delete(body)
+        if not r.success():
+            print(f"[ERROR] delete_reaction 失败: {r.code}, {r.msg}")
+        return r.success(), r
+    except Exception as e:
+        print(f"[ERROR] delete_reaction 网络异常: {e}")
+        return False, None
+
+
+def add_message_reaction_get_id(message_id, emoji_type):
+    ok, r = add_message_reaction(message_id, emoji_type)
+    if not ok or not r or not getattr(r, "data", None):
+        return None
+    return getattr(r.data, "reaction_id", None)
+
+
+def delete_own_reaction_by_type(message_id, emoji_type, reaction_id=None):
+    if reaction_id:
+        ok, _ = delete_message_reaction(message_id, reaction_id)
+        if ok:
+            return True
+    data, _ = list_message_reactions(message_id, emoji_type)
+    if not data:
+        return False
+    for item in getattr(data, "items", None) or []:
+        rid = getattr(item, "reaction_id", None)
+        if rid:
+            ok, _ = delete_message_reaction(message_id, rid)
+            if ok:
+                return True
+    return False
+
+
+def _resolve_sent_target(target, receive_id=None):
+    if not target or target == "last":
+        return _last_sent_message_id(receive_id)
+    return target
 
 
 def _upload_image_sync(file_path):
@@ -719,7 +861,10 @@ def handle_message(data):
         hook_key = f"fs_{open_id}"
         card = _TaskCard(receive_id, rid_type)
         card.start()
-        on_final = lambda raw: _send_generated_files(receive_id, raw, receive_id_type=rid_type)
+        final_raw_holder = {"text": ""}
+        def on_final(raw):
+            final_raw_holder["text"] = raw or ""
+            _send_generated_files(receive_id, raw, receive_id_type=rid_type)
         if not hasattr(agent, '_turn_end_hooks'): agent._turn_end_hooks = {}
         agent._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final)
         try:
@@ -779,7 +924,7 @@ def handle_command(open_id, cmd, chat_id=None):
     elif op == "/new":
         _send_cmd_response(reset_conversation(agent))
     elif op == "/help":
-        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/help - 显示帮助")
+        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/edit last <文本> - 编辑最近一条机器人消息\n/recall last - 撤回最近一条机器人消息\n/react <last|message_id> <emoji_type> - 添加表情回应\n/reactions <last|message_id> [emoji_type] - 查看回应摘要\n/help - 显示帮助")
     elif op == "/status":
         llm = agent.get_llm_name() if agent.llmclient else "未配置"
         _send_cmd_response(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
@@ -794,6 +939,49 @@ def handle_command(open_id, cmd, chat_id=None):
                 return _send_cmd_response(f"用法: /llm <0-{len(agent.list_llms()) - 1}>")
         lines = [f"{'→' if cur else '  '} [{i}] {name}" for i, name, cur in agent.list_llms()]
         _send_cmd_response("LLMs:\n" + "\n".join(lines))
+    elif op == "/edit":
+        if len(parts) < 3:
+            return _send_cmd_response("用法: /edit <last|message_id> <新文本>")
+        target = _resolve_sent_target(parts[1], chat_id or open_id)
+        if not target:
+            return _send_cmd_response("❌ 没有可编辑的最近消息")
+        if not _is_own_sent_message(target):
+            return _send_cmd_response("❌ 只能编辑本机器人已记录的消息")
+        new_text = (cmd or "").split(None, 2)[2]
+        ok, _ = edit_text_message(target, new_text)
+        _send_cmd_response("✅ 已编辑" if ok else "❌ 编辑失败")
+    elif op == "/recall":
+        target = _resolve_sent_target(parts[1] if len(parts) > 1 else "last", chat_id or open_id)
+        if not target:
+            return _send_cmd_response("❌ 没有可撤回的最近消息")
+        if not _is_own_sent_message(target):
+            return _send_cmd_response("❌ 只能撤回本机器人已记录的消息")
+        ok, _ = recall_message(target)
+        _send_cmd_response("✅ 已撤回" if ok else "❌ 撤回失败")
+    elif op == "/react":
+        if len(parts) < 3:
+            return _send_cmd_response("用法: /react <last|message_id> <emoji_type>")
+        target = _resolve_sent_target(parts[1], chat_id or open_id)
+        if not target:
+            return _send_cmd_response("❌ 没有可回应的消息")
+        ok, _ = add_message_reaction(target, parts[2])
+        _send_cmd_response("✅ 已添加 reaction" if ok else "❌ 添加 reaction 失败")
+    elif op == "/reactions":
+        if len(parts) < 2:
+            return _send_cmd_response("用法: /reactions <last|message_id> [emoji_type]")
+        target = _resolve_sent_target(parts[1], chat_id or open_id)
+        if not target:
+            return _send_cmd_response("❌ 没有可查询的消息")
+        data, _ = list_message_reactions(target, parts[2] if len(parts) > 2 else None)
+        if data is None:
+            return _send_cmd_response("❌ 查询 reaction 失败")
+        items = getattr(data, "items", None) or []
+        lines = [f"reactions: {len(items)}"]
+        for item in items[:10]:
+            rtype = getattr(getattr(item, "reaction_type", None), "emoji_type", None) or getattr(item, "reaction_type", "")
+            rid = getattr(item, "reaction_id", "")
+            lines.append(f"- {rtype} {rid}")
+        _send_cmd_response("\n".join(lines))
     elif op == "/restore":
         try:
             restored_info, err = format_restore()
