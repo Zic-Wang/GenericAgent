@@ -1,4 +1,4 @@
-import glob, json, os, queue as Q, re, sys, threading, time
+import glob, json, os, queue as Q, re, sys, threading, time, uuid
 from collections import OrderedDict
 import atexit, hashlib
 try:
@@ -306,6 +306,7 @@ APP_ID = str(mykeys.get("fs_app_id", "") or "").strip()
 APP_SECRET = str(mykeys.get("fs_app_secret", "") or "").strip()
 ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
+APPROVAL_ADMINS = _to_allowed_set(mykeys.get("fs_approval_admins", []))
 AGENT_TIMEOUT_SEC = 900
 # Feishu emoji_type for the transient "bot is typing" reaction.
 TYPING_REACTION_EMOJI = "Typing"
@@ -321,6 +322,14 @@ except Exception as e:
 client, user_tasks = None, {}
 SENT_MESSAGES = OrderedDict()
 _MAX_SENT_MESSAGES = 200
+_APPROVAL_STATE = {}
+_APPROVAL_LOCK = threading.RLock()
+_APPROVAL_CHOICE_MAP = {
+    "approve_once": "once",
+    "approve_session": "session",
+    "approve_always": "always",
+    "deny": "deny",
+}
 
 
 def _record_sent_message(message_id, receive_id=None, receive_id_type=None, msg_type=None):
@@ -397,6 +406,182 @@ def _patch_card_result(message_id, card_json):
     except Exception as e:
         print(f"[ERROR] _patch_card 网络异常: {e}")
         return False, False
+
+
+def _approval_button(label, action_name, approval_id, btn_type="default"):
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": btn_type,
+        "value": {"ga_approval_action": action_name, "approval_id": approval_id},
+    }
+
+
+def build_exec_approval_card(approval_id, cmd, reason, requester=None):
+    content = (
+        "**Command Approval Required**\n\n"
+        f"**Approval ID:** `{approval_id}`\n\n"
+        "**Command:**\n"
+        f"```\n{cmd}\n```\n\n"
+        f"**Reason:** {reason}"
+    )
+    if requester:
+        content += f"\n\n**Requester:** {requester}"
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "Command Approval Required"},
+        },
+        "elements": [
+            {"tag": "markdown", "content": content},
+            {"tag": "action", "actions": [
+                _approval_button("Allow Once", "approve_once", approval_id, "primary"),
+                _approval_button("Session", "approve_session", approval_id),
+                _approval_button("Always", "approve_always", approval_id),
+                _approval_button("Deny", "deny", approval_id, "danger"),
+            ]},
+        ],
+    }
+
+
+def build_approval_result_card(approval_id, cmd, reason, choice, operator_name=None):
+    ok = choice in ("once", "session", "always")
+    title = "Command Approved" if ok else "Command Denied"
+    template = "green" if ok else "red"
+    if choice == "timeout":
+        title, template = "Approval Timeout", "grey"
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": [{"tag": "markdown", "content": (
+            f"**Approval ID:** `{approval_id}`\n\n"
+            f"**Result:** `{choice}`\n\n"
+            f"**Operator:** {operator_name or '-'}\n\n"
+            "**Command:**\n"
+            f"```\n{cmd}\n```\n\n"
+            f"**Reason:** {reason}"
+        )}],
+    }
+
+
+def _approval_response(card=None, toast=None, toast_type="info"):
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+    body = {}
+    if card is not None:
+        body["card"] = {"type": "raw", "data": card}
+    if toast:
+        body["toast"] = {"type": toast_type, "content": toast}
+    return P2CardActionTriggerResponse(body)
+
+
+def _approval_toast(content, toast_type="info"):
+    return _approval_response(toast=content, toast_type=toast_type)
+
+
+def _operator_name(operator):
+    if not operator:
+        return "unknown"
+    return getattr(operator, "open_id", None) or getattr(operator, "user_id", None) or "unknown"
+
+
+def _is_approval_operator_authorized(open_id):
+    if not open_id:
+        return False
+    if APPROVAL_ADMINS:
+        return open_id in APPROVAL_ADMINS
+    if ALLOWED_USERS and "*" not in ALLOWED_USERS:
+        return open_id in ALLOWED_USERS
+    return False
+
+
+def update_approval_card(message_id, approval_id, cmd, reason, choice, operator_name=None):
+    if not message_id:
+        return False
+    card = build_approval_result_card(approval_id, cmd, reason, choice, operator_name)
+    return _patch_card_result(message_id, json.dumps(card, ensure_ascii=False))[0]
+
+
+def send_exec_approval(chat_id, session_key, cmd, reason, requester_open_id=None, timeout_sec=300):
+    """Send a Feishu interactive approval card and block until a button resolves it."""
+    approval_id = uuid.uuid4().hex
+    event = threading.Event()
+    card = build_exec_approval_card(approval_id, cmd, reason, requester_open_id)
+    message_id = _send_raw(chat_id, json.dumps(card, ensure_ascii=False), "interactive", "chat_id")
+    if not message_id:
+        return "deny"
+    state = {
+        "approval_id": approval_id,
+        "session_key": session_key,
+        "cmd": cmd,
+        "reason": reason,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "created_at": time.time(),
+        "event": event,
+        "result": None,
+        "requester_open_id": requester_open_id,
+    }
+    with _APPROVAL_LOCK:
+        _APPROVAL_STATE[approval_id] = state
+    if not event.wait(timeout_sec):
+        with _APPROVAL_LOCK:
+            _APPROVAL_STATE.pop(approval_id, None)
+        update_approval_card(message_id, approval_id, cmd, reason, "timeout", None)
+        return "timeout"
+    return state.get("result") or "deny"
+
+
+def resolve_approval(approval_id, choice, operator_open_id=None, operator_name=None, patch_card=True):
+    with _APPROVAL_LOCK:
+        state = _APPROVAL_STATE.pop(approval_id, None)
+    if not state:
+        return False, "approval not found or expired"
+    state["result"] = choice
+    state["operator_open_id"] = operator_open_id
+    state["operator_name"] = operator_name
+    if patch_card:
+        update_approval_card(
+            state.get("message_id"),
+            state.get("approval_id"),
+            state.get("cmd", ""),
+            state.get("reason", ""),
+            choice,
+            operator_name,
+        )
+    state.get("event").set()
+    return True, state
+
+
+def handle_card_action(data):
+    event = getattr(data, "event", None)
+    action = getattr(event, "action", None)
+    value = getattr(action, "value", None) or {}
+    action_name = value.get("ga_approval_action")
+    approval_id = value.get("approval_id")
+    if action_name not in _APPROVAL_CHOICE_MAP or not approval_id:
+        return _approval_toast("无效审批动作", "warning")
+    operator = getattr(event, "operator", None)
+    open_id = getattr(operator, "open_id", None)
+    operator_name = _operator_name(operator)
+    if not _is_approval_operator_authorized(open_id):
+        print(f"未授权审批用户: {open_id}")
+        return _approval_toast("你没有审批权限", "warning")
+    choice = _APPROVAL_CHOICE_MAP[action_name]
+    ok, state = resolve_approval(approval_id, choice, open_id, operator_name, patch_card=False)
+    if not ok:
+        return _approval_toast("审批已处理或已过期", "warning")
+    result_card = build_approval_result_card(
+        state.get("approval_id", approval_id),
+        state.get("cmd", ""),
+        state.get("reason", ""),
+        choice,
+        operator_name,
+    )
+    return _approval_response(card=result_card)
 
 
 def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
@@ -932,7 +1117,7 @@ def handle_command(open_id, cmd, chat_id=None):
     elif op == "/new":
         _send_cmd_response(reset_conversation(agent))
     elif op == "/help":
-        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/edit last <文本> - 编辑最近一条机器人消息\n/recall last - 撤回最近一条机器人消息\n/react <last|message_id> <emoji_type> - 添加表情回应\n/reactions <last|message_id> [emoji_type] - 查看回应摘要\n/help - 显示帮助")
+        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/edit last <文本> - 编辑最近一条机器人消息\n/recall last - 撤回最近一条机器人消息\n/react <last|message_id> <emoji_type> - 添加表情回应\n/reactions <last|message_id> [emoji_type] - 查看回应摘要\n/approval_test - 发送审批闭环测试卡\n/help - 显示帮助")
     elif op == "/status":
         llm = agent.get_llm_name() if agent.llmclient else "未配置"
         _send_cmd_response(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
@@ -1001,6 +1186,28 @@ def handle_command(open_id, cmd, chat_id=None):
             _send_cmd_response(f"已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
         except Exception as e:
             _send_cmd_response(f"恢复失败: {e}")
+    elif op == "/approval_test":
+        target_chat_id = chat_id or DEFAULT_CHAT_ID
+        if not target_chat_id:
+            return _send_cmd_response("❌ 当前没有可发送审批卡的 chat_id")
+
+        def _run_approval_test():
+            try:
+                choice = send_exec_approval(
+                    target_chat_id,
+                    session_key=f"approval-test:{open_id or target_chat_id}:{int(time.time())}",
+                    cmd="echo approval test",
+                    reason="manual live approval card test",
+                    requester_open_id=open_id,
+                    timeout_sec=180,
+                )
+                print(f"[INFO] approval_test completed: {choice}")
+            except Exception as e:
+                print(f"[ERROR] approval_test failed: {e}")
+                _send_raw(target_chat_id, json.dumps({"text": f"审批测试失败: {e}"}, ensure_ascii=False), "text", "chat_id")
+
+        threading.Thread(target=_run_approval_test, daemon=True).start()
+        _send_cmd_response("已发送审批测试卡，请点击按钮验证。")
     elif op == "/continue" or cmd.startswith("/continue"):
         _send_cmd_response(handle_continue_frontend(agent, cmd))
     else:
@@ -1013,7 +1220,12 @@ def main():
         print("错误: 请在 mykey.py 或 mykey.json 中配置 fs_app_id 和 fs_app_secret")
         sys.exit(1)
     client = create_client()
-    handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(handle_message).build()
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(handle_message)
+        .register_p2_card_action_trigger(handle_card_action)
+        .build()
+    )
     print("=" * 50 + "\n飞书 Agent 已启动（长连接模式）\n" + f"App ID: {APP_ID}\n等待消息...\n" + "=" * 50)
     retry_delay = 5
     while True:
