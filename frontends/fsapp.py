@@ -394,6 +394,30 @@ def _send_raw(receive_id, payload, msg_type, rtype):
     return None
 
 
+def _reply_raw(reply_to_message_id, payload, msg_type, reply_in_thread=False):
+    """Reply to a Feishu message by message_id; caller falls back to _send_raw when no target id."""
+    if not reply_to_message_id:
+        return None
+    try:
+        body = ReplyMessageRequest.builder().message_id(reply_to_message_id).request_body(
+            ReplyMessageRequestBody.builder()
+            .msg_type(msg_type)
+            .content(payload)
+            .reply_in_thread(bool(reply_in_thread))
+            .uuid(str(uuid.uuid4()))
+            .build()
+        ).build()
+        r = client.im.v1.message.reply(body)
+        if r.success():
+            message_id = r.data.message_id if r.data else None
+            _record_sent_message(message_id, reply_to_message_id, "message_id", msg_type)
+            return message_id
+        print(f"回复失败: {r.code}, {r.msg}")
+    except Exception as e:
+        print(f"[ERROR] _reply_raw 网络异常: {e}")
+    return None
+
+
 def _patch_card(message_id, card_json):
     return _patch_card_result(message_id, card_json)[0]
 
@@ -871,11 +895,27 @@ def handle_card_action(data):
     return _approval_toast("审批已处理", "success")
 
 
-def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
+def send_message(
+    receive_id,
+    content,
+    msg_type="text",
+    use_card=False,
+    receive_id_type="open_id",
+    reply_to=None,
+    reply_in_thread=False,
+):
     if use_card:
-        return _send_raw(receive_id, _card(content), "interactive", receive_id_type)
+        payload = _card(content)
+        if reply_to:
+            return _reply_raw(reply_to, payload, "interactive", reply_in_thread=reply_in_thread)
+        return _send_raw(receive_id, payload, "interactive", receive_id_type)
     if msg_type == "text":
-        return _send_raw(receive_id, json.dumps({"text": content}, ensure_ascii=False), "text", receive_id_type)
+        payload = json.dumps({"text": content}, ensure_ascii=False)
+        if reply_to:
+            return _reply_raw(reply_to, payload, "text", reply_in_thread=reply_in_thread)
+        return _send_raw(receive_id, payload, "text", receive_id_type)
+    if reply_to:
+        return _reply_raw(reply_to, content, msg_type, reply_in_thread=reply_in_thread)
     return _send_raw(receive_id, content, msg_type, receive_id_type)
 
 
@@ -1174,8 +1214,10 @@ class _TaskCard:
     _DETAIL_LIMIT = 8000
     _FINAL_LIMIT = 6000
 
-    def __init__(self, receive_id, rid_type):
+    def __init__(self, receive_id, rid_type, reply_to=None, reply_in_thread=False):
         self.rid, self.rtype = receive_id, rid_type
+        self.reply_to = reply_to
+        self.reply_in_thread = reply_in_thread
         self.steps = []          # [(summary, detail), ...]
         self.status = "🤔 思考中..."
         self.final = None
@@ -1213,7 +1255,10 @@ class _TaskCard:
         if self.msg_id:
             return _patch_card_result(self.msg_id, card)
         else:
-            self.msg_id = _send_raw(self.rid, card, "interactive", self.rtype)
+            if self.reply_to:
+                self.msg_id = _reply_raw(self.reply_to, card, "interactive", reply_in_thread=self.reply_in_thread)
+            else:
+                self.msg_id = _send_raw(self.rid, card, "interactive", self.rtype)
             return bool(self.msg_id), False
 
     def _rollover(self):
@@ -1431,13 +1476,22 @@ def handle_message(data):
     )
     if not user_input:
         if chat_id:
-            send_message(chat_id, f"⚠️ 暂不支持处理此类飞书消息：{message.message_type}", receive_id_type="chat_id")
+            send_message(
+                chat_id,
+                f"⚠️ 暂不支持处理此类飞书消息：{message.message_type}",
+                receive_id_type="chat_id",
+                reply_to=incoming_message_id,
+            )
         else:
-            send_message(open_id, f"⚠️ 暂不支持处理此类飞书消息：{message.message_type}")
+            send_message(
+                open_id,
+                f"⚠️ 暂不支持处理此类飞书消息：{message.message_type}",
+                reply_to=incoming_message_id,
+            )
         return
     print(f"收到消息 [{open_id}] ({message.message_type}, {len(image_paths)} images, ga_msg={ga_msg.message_id}): {user_input[:200]}")
     if message.message_type == "text" and user_input.startswith("/"):
-        return handle_command(open_id, user_input, chat_id)
+        return handle_command(open_id, user_input, chat_id, reply_to=incoming_message_id)
 
     def run_agent():
         user_tasks[open_id] = {"running": True}
@@ -1449,7 +1503,7 @@ def handle_message(data):
         done_event = threading.Event()
         ask_user_events = Q.Queue()
         hook_key = f"fs_{open_id}"
-        card = _TaskCard(receive_id, rid_type)
+        card = _TaskCard(receive_id, rid_type, reply_to=incoming_message_id)
         card.start()
         final_raw_holder = {"text": ""}
         def on_final(raw):
@@ -1522,12 +1576,12 @@ def handle_message(data):
     threading.Thread(target=run_agent, daemon=True).start()
 
 
-def handle_command(open_id, cmd, chat_id=None):
+def handle_command(open_id, cmd, chat_id=None, reply_to=None):
     def _send_cmd_response(content):
         if chat_id:
-            send_message(chat_id, content, receive_id_type="chat_id")
+            send_message(chat_id, content, receive_id_type="chat_id", reply_to=reply_to)
         else:
-            send_message(open_id, content)
+            send_message(open_id, content, reply_to=reply_to)
     parts = (cmd or "").split()
     op = (parts[0] if parts else "").lower()
     if op == "/stop":
