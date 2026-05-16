@@ -413,12 +413,15 @@ def _patch_card_result(message_id, card_json):
         return False, False
 
 
-def _approval_button(label, action_name, approval_id, btn_type="default"):
+def _approval_button(label, action_name, approval_id, btn_type="default", extra_value=None):
+    value = {"ga_approval_action": action_name, "approval_id": approval_id}
+    if isinstance(extra_value, dict):
+        value.update(extra_value)
     return {
         "tag": "button",
-        "text": {"tag": "plain_text", "content": label},
+        "text": {"tag": "plain_text", "content": str(label or "-")[:60]},
         "type": btn_type,
-        "value": {"ga_approval_action": action_name, "approval_id": approval_id},
+        "value": value,
     }
 
 
@@ -450,12 +453,109 @@ def build_exec_approval_card(approval_id, cmd, reason, requester=None):
     }
 
 
-def build_approval_result_card(approval_id, cmd, reason, choice, operator_name=None):
-    ok = choice in ("once", "session", "always")
+def _is_ask_user_choice(choice):
+    return str(choice or "").startswith("ask_user_choice:")
+
+
+def _is_ask_user_text(choice):
+    return str(choice or "").startswith("ask_user_text:")
+
+
+def _ask_user_text_value(choice):
+    if not _is_ask_user_text(choice):
+        return None
+    return str(choice or "")[len("ask_user_text:"):]
+
+
+def _ask_user_choice_index(choice):
+    try:
+        prefix, raw_idx = str(choice or "").split(":", 1)
+        if prefix == "ask_user_choice":
+            return int(raw_idx)
+    except Exception:
+        pass
+    return None
+
+
+def build_ask_user_approval_card(approval_id, event, reason, requester=None):
+    question = str((event or {}).get("question") or "请审批下一步操作：")
+    candidates = [str(c) for c in ((event or {}).get("candidates") or []) if str(c).strip()]
+    content = (
+        "**Human Input Required**\n\n"
+        f"**Approval ID:** `{approval_id}`\n\n"
+        "**Question:**\n"
+        f"```\n{question}\n```\n\n"
+        f"**Reason:** {reason}"
+    )
+    if requester:
+        content += f"\n\n**Requester:** {requester}"
+
+    form = {
+        "tag": "form",
+        "name": "ask_user_form",
+        "elements": [
+            {
+                "tag": "input",
+                "name": "ask_user_text",
+                "label": {"tag": "plain_text", "content": "直接填写回复"},
+                "placeholder": {"tag": "plain_text", "content": "请在这里输入要回复给 Agent 的文字"},
+                "default_value": "",
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "提交文字"},
+                "type": "primary",
+                "action_type": "form_submit",
+                "name": "ask_user_text_submit",
+                "value": {"ga_approval_action": "ask_user_text", "approval_id": approval_id},
+            },
+        ],
+    }
+
+    body_elements = [{"tag": "markdown", "content": content}, form]
+    if candidates:
+        actions = [
+            _approval_button(
+                candidate,
+                "ask_user_choice",
+                approval_id,
+                "default",
+                {"candidate_index": idx},
+            )
+            for idx, candidate in enumerate(candidates)
+        ]
+        body_elements.extend({"tag": "action", "actions": actions[i:i + 4]} for i in range(0, len(actions), 4))
+
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "Human Input Required"},
+        },
+        "body": {"elements": body_elements},
+    }
+
+def _approval_result_display(choice, metadata=None):
+    if _is_ask_user_text(choice):
+        return _ask_user_text_value(choice) or ""
+    if _is_ask_user_choice(choice):
+        idx = _ask_user_choice_index(choice)
+        candidates = list((metadata or {}).get("ask_user_candidates") or [])
+        if idx is not None and 0 <= idx < len(candidates):
+            return str(candidates[idx])
+    return str(choice)
+
+
+def build_approval_result_card(approval_id, cmd, reason, choice, operator_name=None, metadata=None):
+    ok = choice in ("once", "session", "always") or _is_ask_user_choice(choice) or _is_ask_user_text(choice)
     title = "Command Approved" if ok else "Command Denied"
+    if _is_ask_user_choice(choice) or _is_ask_user_text(choice):
+        title = "Choice Submitted"
     template = "green" if ok else "red"
     if choice == "timeout":
         title, template = "Approval Timeout", "grey"
+    display_choice = _approval_result_display(choice, metadata)
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
@@ -464,7 +564,7 @@ def build_approval_result_card(approval_id, cmd, reason, choice, operator_name=N
         },
         "elements": [{"tag": "markdown", "content": (
             f"**Approval ID:** `{approval_id}`\n\n"
-            f"**Result:** `{choice}`\n\n"
+            f"**Result:** `{display_choice}`\n\n"
             f"**Operator:** {operator_name or '-'}\n\n"
             "**Command:**\n"
             f"```\n{cmd}\n```\n\n"
@@ -493,6 +593,85 @@ def _operator_name(operator):
     return getattr(operator, "open_id", None) or getattr(operator, "user_id", None) or "unknown"
 
 
+def _card_obj_get(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _extract_ask_user_text_from_action(event, action, value):
+    candidates = []
+    for obj in (action, event, value):
+        if not obj:
+            continue
+        for key in ("form_value", "form_values", "input_values", "inputs"):
+            val = _card_obj_get(obj, key)
+            if isinstance(val, dict):
+                candidates.append(val)
+            elif isinstance(val, list):
+                candidates.extend(item for item in val if isinstance(item, dict))
+    if isinstance(value, dict):
+        candidates.append(value)
+    for form in candidates:
+        if "name" in form and form.get("name") in ("ask_user_text", "input_ask_user_text", "text"):
+            val = form.get("value") or form.get("text") or form.get("content")
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        for key in ("ask_user_text", "input_ask_user_text", "text"):
+            val = form.get(key)
+            if isinstance(val, dict):
+                val = val.get("value") or val.get("text") or val.get("content")
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    return ""
+
+
+def _card_event_message_id(event):
+    for obj in (event, _card_obj_get(event, "context"), _card_obj_get(event, "message")):
+        if not obj:
+            continue
+        for key in ("message_id", "open_message_id", "open_message_id_v2"):
+            val = _card_obj_get(obj, key)
+            if val:
+                return val
+    return None
+
+
+def _approval_id_from_message_id(message_id):
+    if not message_id:
+        return None
+    with _APPROVAL_LOCK:
+        for approval_id, state in _APPROVAL_STATE.items():
+            if state.get("message_id") == message_id:
+                return approval_id
+    return None
+
+
+def _extract_approval_action_context(event, action):
+    raw_value = _card_obj_get(action, "value") or {}
+    value = raw_value if isinstance(raw_value, dict) else {}
+    button_name = _card_obj_get(action, "name")
+    action_name = value.get("ga_approval_action") or value.get("action")
+    if not action_name and button_name == "ask_user_text_submit":
+        action_name = "ask_user_text"
+    text = _extract_ask_user_text_from_action(event, action, value)
+    if not action_name and text and button_name == "ask_user_text_submit":
+        action_name = "ask_user_text"
+    approval_id = value.get("approval_id")
+    if not approval_id:
+        for obj in (action, event):
+            for key in ("form_value", "form_values", "input_values", "inputs"):
+                form = _card_obj_get(obj, key)
+                if isinstance(form, dict) and form.get("approval_id"):
+                    approval_id = form.get("approval_id")
+                    break
+            if approval_id:
+                break
+    if not approval_id:
+        approval_id = _approval_id_from_message_id(_card_event_message_id(event))
+    return action_name, approval_id, value, text
+
+
 def _is_approval_operator_authorized(open_id):
     if not open_id:
         return False
@@ -503,10 +682,10 @@ def _is_approval_operator_authorized(open_id):
     return False
 
 
-def update_approval_card(message_id, approval_id, cmd, reason, choice, operator_name=None):
+def update_approval_card(message_id, approval_id, cmd, reason, choice, operator_name=None, metadata=None):
     if not message_id:
         return False
-    card = build_approval_result_card(approval_id, cmd, reason, choice, operator_name)
+    card = build_approval_result_card(approval_id, cmd, reason, choice, operator_name, metadata=metadata)
     return _patch_card_result(message_id, json.dumps(card, ensure_ascii=False))[0]
 
 
@@ -529,11 +708,12 @@ def _approval_state_from_record(record, local_state=None):
         "created_at": record.created_at,
         "resolved_at": record.resolved_at,
         "expires_at": record.expires_at,
+        "metadata": record.metadata or {},
     })
     return state
 
 
-def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=None, timeout_sec=300, receive_id_type="chat_id"):
+def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=None, timeout_sec=300, receive_id_type="chat_id", ask_user_event=None):
     """Send a Feishu interactive approval card and block until resolved.
 
     The SQLite ApprovalStore is the source of truth for pending/resolved state.
@@ -545,6 +725,13 @@ def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=N
     event = threading.Event()
     _APPROVAL_STORE.cleanup_done()
     _APPROVAL_STORE.expire_pending()
+    metadata = {}
+    if isinstance(ask_user_event, dict):
+        metadata = {
+            "kind": "ask_user",
+            "ask_user_question": str(ask_user_event.get("question") or ""),
+            "ask_user_candidates": [str(c) for c in (ask_user_event.get("candidates") or [])],
+        }
     _APPROVAL_STORE.create_pending(
         approval_id=approval_id,
         session_key=session_key,
@@ -554,6 +741,7 @@ def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=N
         reason=reason,
         requester_open_id=requester_open_id,
         timeout_sec=timeout_sec,
+        metadata=metadata,
     )
     state = {
         "approval_id": approval_id,
@@ -567,12 +755,16 @@ def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=N
         "event": event,
         "result": None,
         "requester_open_id": requester_open_id,
+        "metadata": metadata,
     }
     # Register before sending the card. Feishu users can click very quickly; if the
     # callback arrives before local memory is populated, it looks "expired".
     with _APPROVAL_LOCK:
         _APPROVAL_STATE[approval_id] = state
-    card = build_exec_approval_card(approval_id, cmd, reason, requester_open_id)
+    if isinstance(ask_user_event, dict):
+        card = build_ask_user_approval_card(approval_id, ask_user_event, reason, requester_open_id)
+    else:
+        card = build_exec_approval_card(approval_id, cmd, reason, requester_open_id)
     message_id = _send_raw(receive_id, json.dumps(card, ensure_ascii=False), "interactive", receive_id_type)
     if not message_id:
         with _APPROVAL_LOCK:
@@ -601,7 +793,7 @@ def send_exec_approval(receive_id, session_key, cmd, reason, requester_open_id=N
         _APPROVAL_STATE.pop(approval_id, None)
     result = _APPROVAL_STORE.resolve(approval_id, "timeout")
     timeout_state = _approval_state_from_record(result.record, state)
-    update_approval_card(message_id, approval_id, cmd, reason, "timeout", None)
+    update_approval_card(message_id, approval_id, cmd, reason, "timeout", None, metadata=state.get("metadata"))
     return timeout_state.get("result") or "timeout"
 
 
@@ -641,36 +833,42 @@ def resolve_approval(approval_id, choice, operator_open_id=None, operator_name=N
             state.get("reason", ""),
             state.get("result") or choice,
             operator_name,
+            metadata=state.get("metadata"),
         )
     return True, state
 
 def handle_card_action(data):
     event = getattr(data, "event", None)
     action = getattr(event, "action", None)
-    value = getattr(action, "value", None) or {}
-    action_name = value.get("ga_approval_action")
-    approval_id = value.get("approval_id")
-    if action_name not in _APPROVAL_CHOICE_MAP or not approval_id:
+    action_name, approval_id, value, ask_user_text = _extract_approval_action_context(event, action)
+    if action_name not in _APPROVAL_CHOICE_MAP and action_name not in ("ask_user_choice", "ask_user_text"):
         return _approval_toast("无效审批动作", "warning")
+    if not approval_id:
+        return _approval_toast("无法识别审批请求，请重试或联系管理员", "warning")
     operator = getattr(event, "operator", None)
     open_id = getattr(operator, "open_id", None)
     operator_name = _operator_name(operator)
     if not _is_approval_operator_authorized(open_id):
         print(f"未授权审批用户: {open_id}")
         return _approval_toast("你没有审批权限", "warning")
-    choice = _APPROVAL_CHOICE_MAP[action_name]
-    ok, state = resolve_approval(approval_id, choice, open_id, operator_name, patch_card=False)
+    if action_name == "ask_user_choice":
+        choice = f"ask_user_choice:{value.get('candidate_index')}"
+    elif action_name == "ask_user_text":
+        text = ask_user_text or _extract_ask_user_text_from_action(event, action, value)
+        if not text:
+            return _approval_toast("请填写回复内容", "warning")
+        choice = f"ask_user_text:{text}"
+    else:
+        choice = _APPROVAL_CHOICE_MAP[action_name]
+    ok, state = resolve_approval(approval_id, choice, open_id, operator_name, patch_card=True)
     if not ok:
         print(f"[WARN] approval action missing or expired: approval_id={approval_id}, operator={open_id}")
         return _approval_toast("审批已处理或已过期", "warning")
-    result_card = build_approval_result_card(
-        state.get("approval_id", approval_id),
-        state.get("cmd", ""),
-        state.get("reason", ""),
-        choice,
-        operator_name,
-    )
-    return _approval_response(card=result_card)
+    if action_name == "ask_user_text":
+        return _approval_toast("回复已提交", "success")
+    if action_name == "ask_user_choice":
+        return _approval_toast("选项已提交", "success")
+    return _approval_toast("审批已处理", "success")
 
 
 def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
@@ -1092,24 +1290,27 @@ def _candidate_score(candidate, keywords):
 
 
 def _select_ask_user_candidate(event, approval_choice):
+    if _is_ask_user_text(approval_choice):
+        return _ask_user_text_value(approval_choice) or ""
     candidates = list((event or {}).get("candidates") or [])
+    idx = _ask_user_choice_index(approval_choice)
+    if idx is not None and 0 <= idx < len(candidates):
+        return candidates[idx]
     if not candidates:
-        return {
-            "approve_once": "Allow Once",
-            "approve_session": "Allow Session",
-            "approve_always": "Always Allow",
-            "deny": "Deny",
-            "timeout": "Deny",
-        }.get(approval_choice, str(approval_choice or "Deny"))
+        return str(approval_choice or "Deny")
+    # Backward-compatible fallback for old approval cards that used once/session/always/deny.
     keyword_map = {
         "approve_once": ["allow once", "once", "本次", "一次", "允许"],
+        "once": ["allow once", "once", "本次", "一次", "允许"],
         "approve_session": ["session", "会话", "本会话"],
+        "session": ["session", "会话", "本会话"],
         "approve_always": ["always", "永久", "始终", "以后"],
+        "always": ["always", "永久", "始终", "以后"],
         "deny": ["deny", "reject", "拒绝", "不允许", "取消", "no"],
         "timeout": ["deny", "reject", "拒绝", "不允许", "取消", "no"],
     }
     keywords = keyword_map.get(approval_choice) or []
-    ranked = sorted((( _candidate_score(c, keywords), idx, c) for idx, c in enumerate(candidates)), reverse=True)
+    ranked = sorted(((_candidate_score(c, keywords), idx, c) for idx, c in enumerate(candidates)), reverse=True)
     if ranked and ranked[0][0] > 0:
         return ranked[0][2]
     if approval_choice in ("deny", "timeout"):
@@ -1297,6 +1498,7 @@ def handle_message(data):
                         reason="agent requested human approval via ask_user",
                         requester_open_id=open_id,
                         timeout_sec=AGENT_TIMEOUT_SEC,
+                        ask_user_event=ask_event,
                     )
                     selected = _select_ask_user_candidate(ask_event, choice)
                     card.step("审批结果", f"{choice}: {selected}")
